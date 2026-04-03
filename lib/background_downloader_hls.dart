@@ -12,6 +12,35 @@ import 'types.dart';
 export 'package:background_downloader/background_downloader.dart';
 export 'types.dart';
 
+enum _SessionControl { none, pause, cancel, delete }
+
+class _HlsDownloadSession {
+  _HlsDownloadSession({
+    required this.downloadId,
+    required this.manifestUrl,
+    required this.fileName,
+    required this.options,
+  });
+
+  final String downloadId;
+  final String manifestUrl;
+  final String fileName;
+  final HlsDownloadOptions options;
+
+  HlsDownloadPhase phase = HlsDownloadPhase.preparing;
+  _SessionControl control = _SessionControl.none;
+
+  List<String> segmentTaskIds = const [];
+  String? segmentDirectoryPath;
+  String? outputFilePath;
+  String? finalTaskId;
+
+  bool get isActive =>
+      phase == HlsDownloadPhase.preparing ||
+      phase == HlsDownloadPhase.downloading ||
+      phase == HlsDownloadPhase.combining;
+}
+
 @pragma('vm:entry-point')
 class HlsDownloader {
   HlsDownloader({
@@ -27,6 +56,7 @@ class HlsDownloader {
   final Map<String, StreamController<HlsOverallTaskUpdate>>
   _overallUpdateControllers = {};
   final Map<String, HlsOverallTaskUpdate> _latestOverallUpdates = {};
+  final Map<String, _HlsDownloadSession> _sessions = {};
 
   void dispose() {
     for (final controller in _overallUpdateControllers.values) {
@@ -36,6 +66,7 @@ class HlsDownloader {
     }
     _overallUpdateControllers.clear();
     _latestOverallUpdates.clear();
+    _sessions.clear();
     _helper.dispose();
   }
 
@@ -49,6 +80,166 @@ class HlsDownloader {
     }
     final controller = _overallControllerFor(trimmedDownloadId);
     return controller.stream;
+  }
+
+  HlsDownloadPhase? phaseFor(String downloadId) {
+    return _sessions[downloadId.trim()]?.phase;
+  }
+
+  bool isPaused(String downloadId) {
+    return phaseFor(downloadId) == HlsDownloadPhase.paused;
+  }
+
+  Future<void> pauseDownload(String downloadId) async {
+    final normalizedId = downloadId.trim();
+    if (normalizedId.isEmpty) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.invalidOptions,
+        message: 'downloadId cannot be blank',
+      );
+    }
+
+    final session = _sessions[normalizedId];
+    if (session == null) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.downloadNotFound,
+        message: 'No download found for this downloadId',
+      );
+    }
+
+    if (!session.isActive) {
+      if (session.phase == HlsDownloadPhase.paused) {
+        return;
+      }
+      throw HlsDownloadException(
+        code: HlsErrorCode.invalidOptions,
+        message: 'Cannot pause download in ${session.phase.name} state',
+      );
+    }
+
+    session.control = _SessionControl.pause;
+    await _cancelTasksForDownloadId(
+      normalizedId,
+      preferredTaskIds: session.segmentTaskIds,
+    );
+  }
+
+  Future<HlsDownloadResult> resumeDownload(String downloadId) async {
+    final normalizedId = downloadId.trim();
+    if (normalizedId.isEmpty) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.invalidOptions,
+        message: 'downloadId cannot be blank',
+      );
+    }
+
+    final session = _sessions[normalizedId];
+    if (session == null) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.downloadNotFound,
+        message: 'No paused download found for this downloadId',
+      );
+    }
+
+    if (session.isActive) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.downloadAlreadyRunning,
+        message: 'This download is already running',
+      );
+    }
+
+    if (session.phase != HlsDownloadPhase.paused &&
+        session.phase != HlsDownloadPhase.failed) {
+      throw HlsDownloadException(
+        code: HlsErrorCode.invalidOptions,
+        message: 'Cannot resume download in ${session.phase.name} state',
+      );
+    }
+
+    return downloadToFile(
+      session.manifestUrl,
+      session.fileName,
+      options: session.options.copyWith(downloadId: normalizedId),
+    );
+  }
+
+  Future<void> cancelDownload(String downloadId) async {
+    final normalizedId = downloadId.trim();
+    if (normalizedId.isEmpty) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.invalidOptions,
+        message: 'downloadId cannot be blank',
+      );
+    }
+
+    final session = _sessions[normalizedId];
+    if (session != null) {
+      session.control = _SessionControl.cancel;
+    }
+
+    await _cancelTasksForDownloadId(
+      normalizedId,
+      preferredTaskIds: session?.segmentTaskIds ?? const [],
+    );
+
+    if (session == null || !session.isActive) {
+      if (session != null) {
+        session.phase = HlsDownloadPhase.canceled;
+      }
+      _emitOverallUpdate(
+        HlsOverallTaskUpdate(
+          downloadId: normalizedId,
+          phase: HlsDownloadPhase.canceled,
+          totalSegments: _latestOverallUpdates[normalizedId]?.totalSegments ?? 0,
+          completedSegments:
+              _latestOverallUpdates[normalizedId]?.completedSegments ?? 0,
+          failedSegments: _latestOverallUpdates[normalizedId]?.failedSegments ??
+              0,
+          progress: _latestOverallUpdates[normalizedId]?.progress ?? 0.0,
+          message: 'Canceled',
+        ),
+      );
+      _sessions.remove(normalizedId);
+      await _closeOverallController(normalizedId, keepLatestUpdate: false);
+    }
+  }
+
+  Future<void> deleteDownload(String downloadId) async {
+    final normalizedId = downloadId.trim();
+    if (normalizedId.isEmpty) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.invalidOptions,
+        message: 'downloadId cannot be blank',
+      );
+    }
+
+    final session = _sessions[normalizedId];
+    if (session != null) {
+      session.control = _SessionControl.delete;
+    }
+
+    await _cancelTasksForDownloadId(
+      normalizedId,
+      preferredTaskIds: session?.segmentTaskIds ?? const [],
+    );
+    await _deleteStoredOutputForDownload(normalizedId, session);
+    await _safeDeleteTaskGroupArtifacts(normalizedId);
+
+    _sessions.remove(normalizedId);
+    _emitOverallUpdate(
+      HlsOverallTaskUpdate(
+        downloadId: normalizedId,
+        phase: HlsDownloadPhase.canceled,
+        totalSegments: _latestOverallUpdates[normalizedId]?.totalSegments ?? 0,
+        completedSegments:
+            _latestOverallUpdates[normalizedId]?.completedSegments ?? 0,
+        failedSegments: _latestOverallUpdates[normalizedId]?.failedSegments ?? 0,
+        progress: _latestOverallUpdates[normalizedId]?.progress ?? 0.0,
+        message: 'Deleted',
+      ),
+    );
+
+    await _closeOverallController(normalizedId, keepLatestUpdate: false);
   }
 
   @Deprecated('Use downloadToFile for typed result and stronger validation.')
@@ -107,10 +298,33 @@ class HlsDownloader {
 
     final downloadId = customDownloadId ?? _helper.generateId();
 
+    final activeSession = _sessions[downloadId];
+    if (activeSession != null && activeSession.isActive) {
+      throw const HlsDownloadException(
+        code: HlsErrorCode.downloadAlreadyRunning,
+        message: 'This download is already running',
+      );
+    }
+
+    final session = _HlsDownloadSession(
+      downloadId: downloadId,
+      manifestUrl: manifestUrl,
+      fileName: fileName,
+      options: options,
+    );
+    _sessions[downloadId] = session;
+    session.control = _SessionControl.none;
+    session.phase = HlsDownloadPhase.preparing;
+    session.segmentTaskIds = const [];
+    session.segmentDirectoryPath = null;
+    session.outputFilePath = null;
+    session.finalTaskId = null;
+
     String? segmentDirectoryPath;
     List<String> segmentTaskIds = const [];
     try {
       await _fileDownloader.trackTasks();
+      session.phase = HlsDownloadPhase.preparing;
       _emitOverallUpdate(
         HlsOverallTaskUpdate(
           downloadId: downloadId,
@@ -139,6 +353,7 @@ class HlsDownloader {
       final appDocDir = await getApplicationDocumentsDirectory();
       final relativeSegmentDirectory = p.join('hls_segments', downloadId);
       segmentDirectoryPath = p.join(appDocDir.path, relativeSegmentDirectory);
+      session.segmentDirectoryPath = segmentDirectoryPath;
       await Directory(segmentDirectoryPath).create(recursive: true);
 
       final downloadTasks = <DownloadTask>[];
@@ -162,9 +377,11 @@ class HlsDownloader {
       }
 
       segmentTaskIds = downloadTasks.map((task) => task.taskId).toList();
+      session.segmentTaskIds = segmentTaskIds;
 
       var completedSegments = 0;
       var failedSegments = 0;
+      session.phase = HlsDownloadPhase.downloading;
 
       _emitOverallUpdate(
         HlsOverallTaskUpdate(
@@ -238,7 +455,64 @@ class HlsDownloader {
 
       await _removeTemporarySegmentTaskRecords(segmentTaskIds);
 
+      if (session.control == _SessionControl.pause) {
+        final lastKnown = _latestOverallUpdates[downloadId];
+        session.phase = HlsDownloadPhase.paused;
+        _emitOverallUpdate(
+          HlsOverallTaskUpdate(
+            downloadId: downloadId,
+            phase: HlsDownloadPhase.paused,
+            totalSegments: manifest.segments.length,
+            completedSegments:
+                lastKnown?.completedSegments ?? completedSegments,
+            failedSegments: lastKnown?.failedSegments ?? failedSegments,
+            progress:
+                (lastKnown?.progress ??
+                        (manifest.segments.isEmpty
+                            ? 0.0
+                            : (completedSegments + failedSegments) /
+                                manifest.segments.length))
+                    .clamp(0.0, 1.0),
+            message: 'Paused',
+            latestTaskUpdate: lastKnown?.latestTaskUpdate,
+          ),
+        );
+        throw const HlsDownloadException(
+          code: HlsErrorCode.downloadPaused,
+          message: 'Download paused',
+        );
+      }
+
+      if (session.control == _SessionControl.cancel ||
+          session.control == _SessionControl.delete) {
+        final lastKnown = _latestOverallUpdates[downloadId];
+        session.phase = HlsDownloadPhase.canceled;
+        await _deleteStoredOutputForDownload(downloadId, session);
+        await _safeDeleteTaskGroupArtifacts(downloadId);
+        _sessions.remove(downloadId);
+        _emitOverallUpdate(
+          HlsOverallTaskUpdate(
+            downloadId: downloadId,
+            phase: HlsDownloadPhase.canceled,
+            totalSegments: manifest.segments.length,
+            completedSegments:
+                lastKnown?.completedSegments ?? completedSegments,
+            failedSegments: lastKnown?.failedSegments ?? failedSegments,
+            progress: (lastKnown?.progress ?? 0.0).clamp(0.0, 1.0),
+            message: session.control == _SessionControl.delete
+                ? 'Deleted'
+                : 'Canceled',
+            latestTaskUpdate: lastKnown?.latestTaskUpdate,
+          ),
+        );
+        throw const HlsDownloadException(
+          code: HlsErrorCode.downloadCanceled,
+          message: 'Download canceled',
+        );
+      }
+
       if (batch.numFailed > 0) {
+        session.phase = HlsDownloadPhase.failed;
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
             downloadId: downloadId,
@@ -260,6 +534,7 @@ class HlsDownloader {
       String? outputFilePath;
       String? finalTaskId;
       if (options.combineSegments) {
+        session.phase = HlsDownloadPhase.combining;
         final outputFileName = _helper.buildOutputFileName(
           fileName,
           options.outputFileExtension,
@@ -270,6 +545,7 @@ class HlsDownloader {
             : appDocDir.path;
         await Directory(outputRootPath).create(recursive: true);
         outputFilePath = p.join(outputRootPath, outputFileName);
+        session.outputFilePath = outputFilePath;
 
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
@@ -290,6 +566,17 @@ class HlsDownloader {
           customHeaders: options.customHeaders,
         );
 
+        if (session.control == _SessionControl.cancel ||
+            session.control == _SessionControl.delete) {
+          session.phase = HlsDownloadPhase.canceled;
+          await _deleteStoredOutputForDownload(downloadId, session);
+          await _safeDeleteTaskGroupArtifacts(downloadId);
+          throw const HlsDownloadException(
+            code: HlsErrorCode.downloadCanceled,
+            message: 'Download canceled',
+          );
+        }
+
         finalTaskId = await _storeFinalOutputTaskRecord(
           downloadId: downloadId,
           filePath: outputFilePath,
@@ -298,6 +585,7 @@ class HlsDownloader {
           displayName: fileName,
           segmentCount: manifest.segments.length,
         );
+        session.finalTaskId = finalTaskId;
 
         if (options.deleteSegmentsAfterCombine) {
           await _safeDeleteDirectory(segmentDirectoryPath);
@@ -314,6 +602,7 @@ class HlsDownloader {
             message: 'Completed',
           ),
         );
+        session.phase = HlsDownloadPhase.completed;
       } else {
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
@@ -326,6 +615,7 @@ class HlsDownloader {
             message: 'Completed',
           ),
         );
+        session.phase = HlsDownloadPhase.completed;
       }
 
       return HlsDownloadResult(
@@ -343,27 +633,40 @@ class HlsDownloader {
       if (segmentTaskIds.isNotEmpty) {
         await _removeTemporarySegmentTaskRecords(segmentTaskIds);
       }
+
+      final isPaused = error.code == HlsErrorCode.downloadPaused;
+      final isCanceled = error.code == HlsErrorCode.downloadCanceled;
+
+      if (!isPaused && !isCanceled) {
+        session.phase = HlsDownloadPhase.failed;
+      }
+
       final lastKnown = _latestOverallUpdates[downloadId];
-      _emitOverallUpdate(
-        HlsOverallTaskUpdate(
-          downloadId: downloadId,
-          phase: HlsDownloadPhase.failed,
-          totalSegments: lastKnown?.totalSegments ?? 0,
-          completedSegments: lastKnown?.completedSegments ?? 0,
-          failedSegments: lastKnown?.failedSegments ?? 0,
-          progress: lastKnown?.progress ?? 0.0,
+      if (!isPaused && !isCanceled) {
+        _emitOverallUpdate(
+          HlsOverallTaskUpdate(
+            downloadId: downloadId,
+            phase: HlsDownloadPhase.failed,
+            totalSegments: lastKnown?.totalSegments ?? 0,
+            completedSegments: lastKnown?.completedSegments ?? 0,
+            failedSegments: lastKnown?.failedSegments ?? 0,
+            progress: lastKnown?.progress ?? 0.0,
+            message: error.message,
+            latestTaskUpdate: lastKnown?.latestTaskUpdate,
+          ),
+        );
+        _log(
+          options: options,
+          level: HlsLogLevel.error,
           message: error.message,
-          latestTaskUpdate: lastKnown?.latestTaskUpdate,
-        ),
-      );
-      _log(
-        options: options,
-        level: HlsLogLevel.error,
-        message: error.message,
-        error: error,
-        stackTrace: stackTrace,
-      );
-      if (!options.keepTempFilesOnFailure && segmentDirectoryPath != null) {
+          error: error,
+          stackTrace: stackTrace,
+        );
+      }
+      if (!isPaused &&
+          !isCanceled &&
+          !options.keepTempFilesOnFailure &&
+          segmentDirectoryPath != null) {
         await _safeDeleteDirectory(segmentDirectoryPath);
       }
       rethrow;
@@ -371,6 +674,7 @@ class HlsDownloader {
       if (segmentTaskIds.isNotEmpty) {
         await _removeTemporarySegmentTaskRecords(segmentTaskIds);
       }
+      session.phase = HlsDownloadPhase.failed;
       final lastKnown = _latestOverallUpdates[downloadId];
       _emitOverallUpdate(
         HlsOverallTaskUpdate(
@@ -401,7 +705,9 @@ class HlsDownloader {
         stackTrace: stackTrace,
       );
     } finally {
-      await _closeOverallController(downloadId);
+      if (session.phase != HlsDownloadPhase.paused) {
+        await _closeOverallController(downloadId, keepLatestUpdate: false);
+      }
     }
   }
 
@@ -428,18 +734,105 @@ class HlsDownloader {
 
   void _emitOverallUpdate(HlsOverallTaskUpdate update) {
     _latestOverallUpdates[update.downloadId] = update;
+    final session = _sessions[update.downloadId];
+    if (session != null) {
+      session.phase = update.phase;
+    }
     final controller = _overallUpdateControllers[update.downloadId];
     if (controller != null && !controller.isClosed) {
       controller.add(update);
     }
   }
 
-  Future<void> _closeOverallController(String downloadId) async {
+  Future<void> _closeOverallController(
+    String downloadId, {
+    bool keepLatestUpdate = false,
+  }) async {
     final controller = _overallUpdateControllers.remove(downloadId);
     if (controller != null && !controller.isClosed) {
       await controller.close();
     }
-    _latestOverallUpdates.remove(downloadId);
+    if (!keepLatestUpdate) {
+      _latestOverallUpdates.remove(downloadId);
+    }
+  }
+
+  Future<void> _cancelTasksForDownloadId(
+    String downloadId, {
+    Iterable<String> preferredTaskIds = const [],
+  }) async {
+    final cleanedIds = preferredTaskIds
+        .map((taskId) => taskId.trim())
+        .where((taskId) => taskId.isNotEmpty)
+        .toSet()
+        .toList();
+
+    try {
+      if (cleanedIds.isNotEmpty) {
+        await _fileDownloader.cancelTasksWithIds(cleanedIds);
+      }
+
+      await _fileDownloader.cancelAll(group: downloadId);
+
+      final records = await _fileDownloader.database.allRecords(group: downloadId);
+      if (records.isNotEmpty) {
+        await _fileDownloader.cancelTasksWithIds(
+          records.map((record) => record.taskId),
+        );
+      }
+    } catch (_) {
+      // Intentionally ignored.
+    }
+  }
+
+  Future<void> _deleteStoredOutputForDownload(
+    String downloadId,
+    _HlsDownloadSession? session,
+  ) async {
+    final outputCandidates = <String>{};
+
+    final sessionOutput = session?.outputFilePath?.trim();
+    if (sessionOutput != null && sessionOutput.isNotEmpty) {
+      outputCandidates.add(sessionOutput);
+    }
+
+    final records = await _fileDownloader.database.allRecords(group: downloadId);
+    for (final record in records) {
+      if (record.task.taskId == 'hls-final-$downloadId') {
+        try {
+          final path = await record.task.filePath();
+          if (path.trim().isNotEmpty) {
+            outputCandidates.add(path);
+          }
+        } catch (_) {
+          // Intentionally ignored.
+        }
+      }
+    }
+
+    for (final path in outputCandidates) {
+      await _safeDeleteFile(path);
+    }
+  }
+
+  Future<void> _safeDeleteTaskGroupArtifacts(String downloadId) async {
+    final appDocDir = await getApplicationDocumentsDirectory();
+    await _safeDeleteDirectory(p.join(appDocDir.path, 'hls_segments', downloadId));
+    await _deleteTaskRecordsByGroup(downloadId);
+  }
+
+  Future<void> _deleteTaskRecordsByGroup(String group) async {
+    try {
+      final records = await _fileDownloader.database.allRecords(group: group);
+      if (records.isEmpty) {
+        return;
+      }
+      await _fileDownloader.database.deleteRecordsWithIds(
+        records.map((record) => record.taskId),
+      );
+    } catch (_) {
+      // Intentionally ignored.
+    }
   }
 
   Future<void> _removeTemporarySegmentTaskRecords(
@@ -500,6 +893,17 @@ class HlsDownloader {
       final directory = Directory(path);
       if (await directory.exists()) {
         await directory.delete(recursive: true);
+      }
+    } catch (_) {
+      // Intentionally ignored.
+    }
+  }
+
+  Future<void> _safeDeleteFile(String path) async {
+    try {
+      final file = File(path);
+      if (await file.exists()) {
+        await file.delete();
       }
     } catch (_) {
       // Intentionally ignored.

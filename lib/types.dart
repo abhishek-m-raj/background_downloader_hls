@@ -4,7 +4,15 @@ enum HlsVariantSelection { highestBandwidth, lowestBandwidth, first }
 
 enum HlsLogLevel { none, error, info, debug }
 
-enum HlsDownloadPhase { preparing, downloading, combining, completed, failed }
+enum HlsDownloadPhase {
+  preparing,
+  downloading,
+  combining,
+  paused,
+  canceled,
+  completed,
+  failed,
+}
 
 typedef HlsLogCallback =
     void Function(
@@ -99,7 +107,9 @@ class HlsOverallTaskUpdate {
   final TaskUpdate? latestTaskUpdate;
 
   bool get isTerminal =>
-      phase == HlsDownloadPhase.completed || phase == HlsDownloadPhase.failed;
+      phase == HlsDownloadPhase.completed ||
+      phase == HlsDownloadPhase.failed ||
+      phase == HlsDownloadPhase.canceled;
 }
 
 class HlsResolvedManifest {
@@ -169,6 +179,10 @@ class HlsErrorCode {
   static const String encryptionKeyFetchFailed = 'encryption_key_fetch_failed';
   static const String combineFailed = 'combine_failed';
   static const String storagePermissionDenied = 'storage_permission_denied';
+  static const String downloadNotFound = 'download_not_found';
+  static const String downloadAlreadyRunning = 'download_already_running';
+  static const String downloadPaused = 'download_paused';
+  static const String downloadCanceled = 'download_canceled';
   static const String unexpected = 'unexpected';
 }
 
