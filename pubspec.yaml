@@ -7,7 +7,14 @@ topics:
   - hls
   - download
   - media
-  - background_downloader
+  - background
+
+platforms:
+  android:
+  ios:
+  linux:
+  macos:
+  windows:
 
 environment:
   sdk: ^3.8.1
