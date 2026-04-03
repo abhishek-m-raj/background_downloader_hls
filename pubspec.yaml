@@ -1,15 +1,20 @@
 name: background_downloader_hls
-description: "A new Flutter package project."
-version: 0.0.1
-homepage:
+description: "A Flutter package to download and combine HLS (.m3u8) streams with validation, variant selection, and cross-platform path handling."
+version: 0.1.0
 
 environment:
   sdk: ^3.8.1
   flutter: ">=1.17.0"
 
 dependencies:
+  background_downloader: ^9.2.3
+  encrypt: ^5.0.3
   flutter:
     sdk: flutter
+  flutter_hls_parser: ^2.0.1
+  http: ^1.4.0
+  path: ^1.9.1
+  path_provider: ^2.1.5
 
 dev_dependencies:
   flutter_test:
