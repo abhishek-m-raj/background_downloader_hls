@@ -93,6 +93,10 @@ class HlsOverallTaskUpdate {
     required this.completedSegments,
     required this.failedSegments,
     required this.progress,
+    this.totalExpectedFileSize,
+    this.downloadedBytes,
+    this.networkSpeed,
+    this.timeRemaining,
     this.message,
     this.latestTaskUpdate,
   });
@@ -103,6 +107,10 @@ class HlsOverallTaskUpdate {
   final int completedSegments;
   final int failedSegments;
   final double progress;
+  final int? totalExpectedFileSize;
+  final int? downloadedBytes;
+  final double? networkSpeed;
+  final Duration? timeRemaining;
   final String? message;
   final TaskUpdate? latestTaskUpdate;
 

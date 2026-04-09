@@ -41,6 +41,34 @@ class _HlsDownloadSession {
       phase == HlsDownloadPhase.combining;
 }
 
+class _SegmentTelemetry {
+  _SegmentTelemetry({required this.taskId, required this.index});
+
+  final String taskId;
+  final int index;
+
+  double progress = 0.0;
+  int? expectedFileSize;
+  double? networkSpeed;
+  DateTime lastUpdated = DateTime.now();
+}
+
+class _AggregatedTelemetry {
+  const _AggregatedTelemetry({
+    required this.progress,
+    this.totalExpectedFileSize,
+    this.downloadedBytes,
+    this.networkSpeed,
+    this.timeRemaining,
+  });
+
+  final double progress;
+  final int? totalExpectedFileSize;
+  final int? downloadedBytes;
+  final double? networkSpeed;
+  final Duration? timeRemaining;
+}
+
 @pragma('vm:entry-point')
 class HlsDownloader {
   HlsDownloader({
@@ -80,6 +108,14 @@ class HlsDownloader {
     }
     final controller = _overallControllerFor(trimmedDownloadId);
     return controller.stream;
+  }
+
+  HlsOverallTaskUpdate? latestOverallUpdate(String downloadId) {
+    final trimmedDownloadId = downloadId.trim();
+    if (trimmedDownloadId.isEmpty) {
+      return null;
+    }
+    return _latestOverallUpdates[trimmedDownloadId];
   }
 
   HlsDownloadPhase? phaseFor(String downloadId) {
@@ -183,6 +219,7 @@ class HlsDownloader {
     );
 
     if (session == null || !session.isActive) {
+      final lastKnown = _latestOverallUpdates[normalizedId];
       if (session != null) {
         session.phase = HlsDownloadPhase.canceled;
       }
@@ -190,12 +227,14 @@ class HlsDownloader {
         HlsOverallTaskUpdate(
           downloadId: normalizedId,
           phase: HlsDownloadPhase.canceled,
-          totalSegments: _latestOverallUpdates[normalizedId]?.totalSegments ?? 0,
-          completedSegments:
-              _latestOverallUpdates[normalizedId]?.completedSegments ?? 0,
-          failedSegments: _latestOverallUpdates[normalizedId]?.failedSegments ??
-              0,
-          progress: _latestOverallUpdates[normalizedId]?.progress ?? 0.0,
+          totalSegments: lastKnown?.totalSegments ?? 0,
+          completedSegments: lastKnown?.completedSegments ?? 0,
+          failedSegments: lastKnown?.failedSegments ?? 0,
+          progress: lastKnown?.progress ?? 0.0,
+          totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+          downloadedBytes: lastKnown?.downloadedBytes,
+          networkSpeed: null,
+          timeRemaining: null,
           message: 'Canceled',
         ),
       );
@@ -226,15 +265,19 @@ class HlsDownloader {
     await _safeDeleteTaskGroupArtifacts(normalizedId);
 
     _sessions.remove(normalizedId);
+    final lastKnown = _latestOverallUpdates[normalizedId];
     _emitOverallUpdate(
       HlsOverallTaskUpdate(
         downloadId: normalizedId,
         phase: HlsDownloadPhase.canceled,
-        totalSegments: _latestOverallUpdates[normalizedId]?.totalSegments ?? 0,
-        completedSegments:
-            _latestOverallUpdates[normalizedId]?.completedSegments ?? 0,
-        failedSegments: _latestOverallUpdates[normalizedId]?.failedSegments ?? 0,
-        progress: _latestOverallUpdates[normalizedId]?.progress ?? 0.0,
+        totalSegments: lastKnown?.totalSegments ?? 0,
+        completedSegments: lastKnown?.completedSegments ?? 0,
+        failedSegments: lastKnown?.failedSegments ?? 0,
+        progress: lastKnown?.progress ?? 0.0,
+        totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+        downloadedBytes: lastKnown?.downloadedBytes,
+        networkSpeed: null,
+        timeRemaining: null,
         message: 'Deleted',
       ),
     );
@@ -322,6 +365,7 @@ class HlsDownloader {
 
     String? segmentDirectoryPath;
     List<String> segmentTaskIds = const [];
+    final Map<String, _SegmentTelemetry> segmentTelemetryByTaskId = {};
     try {
       await _fileDownloader.trackTasks();
       session.phase = HlsDownloadPhase.preparing;
@@ -359,20 +403,23 @@ class HlsDownloader {
       final downloadTasks = <DownloadTask>[];
       for (var i = 0; i < manifest.segments.length; i++) {
         final segment = manifest.segments[i];
-        downloadTasks.add(
-          DownloadTask(
-            url: segment.uri.toString(),
-            headers: options.customHeaders,
-            filename: _helper.segmentFileName(i + 1),
-            directory: relativeSegmentDirectory,
-            baseDirectory: BaseDirectory.applicationDocuments,
-            retries: options.retryAttempts,
-            group: downloadId,
-            metaData: jsonEncode({
-              'segmentIndex': i,
-              'totalSegments': manifest.segments.length,
-            }),
-          ),
+        final task = DownloadTask(
+          url: segment.uri.toString(),
+          headers: options.customHeaders,
+          filename: _helper.segmentFileName(i + 1),
+          directory: relativeSegmentDirectory,
+          baseDirectory: BaseDirectory.applicationDocuments,
+          retries: options.retryAttempts,
+          group: downloadId,
+          metaData: jsonEncode({
+            'segmentIndex': i,
+            'totalSegments': manifest.segments.length,
+          }),
+        );
+        downloadTasks.add(task);
+        segmentTelemetryByTaskId[task.taskId] = _SegmentTelemetry(
+          taskId: task.taskId,
+          index: i,
         );
       }
 
@@ -401,51 +448,95 @@ class HlsDownloader {
           completedSegments = succeeded;
           failedSegments = failed;
           options.batchProgressCallback?.call(succeeded, failed);
-          final total = manifest.segments.length;
-          final progress = total > 0 ? (succeeded + failed) / total : 0.0;
+
+          final aggregate = _aggregateDownloadTelemetry(
+            segmentTelemetryByTaskId: segmentTelemetryByTaskId,
+            totalSegments: manifest.segments.length,
+            completedSegments: completedSegments,
+            failedSegments: failedSegments,
+          );
+
           _emitOverallUpdate(
             HlsOverallTaskUpdate(
               downloadId: downloadId,
               phase: HlsDownloadPhase.downloading,
-              totalSegments: total,
+              totalSegments: manifest.segments.length,
               completedSegments: completedSegments,
               failedSegments: failedSegments,
-              progress: progress.clamp(0.0, 1.0),
+              progress: aggregate.progress,
+              totalExpectedFileSize: aggregate.totalExpectedFileSize,
+              downloadedBytes: aggregate.downloadedBytes,
+              networkSpeed: aggregate.networkSpeed,
+              timeRemaining: aggregate.timeRemaining,
               message: 'Downloading segments',
             ),
           );
         },
         taskStatusCallback: (statusUpdate) {
-          final total = manifest.segments.length;
-          final progress = total > 0
-              ? (completedSegments + failedSegments) / total
-              : 0.0;
+          final segmentTaskId = statusUpdate.task.taskId;
+          final segment = segmentTelemetryByTaskId[segmentTaskId];
+          if (segment != null) {
+            _applySegmentStatus(segment, statusUpdate.status);
+          }
+
+          final aggregate = _aggregateDownloadTelemetry(
+            segmentTelemetryByTaskId: segmentTelemetryByTaskId,
+            totalSegments: manifest.segments.length,
+            completedSegments: completedSegments,
+            failedSegments: failedSegments,
+          );
+
           _emitOverallUpdate(
             HlsOverallTaskUpdate(
               downloadId: downloadId,
               phase: HlsDownloadPhase.downloading,
-              totalSegments: total,
+              totalSegments: manifest.segments.length,
               completedSegments: completedSegments,
               failedSegments: failedSegments,
-              progress: progress.clamp(0.0, 1.0),
+              progress: aggregate.progress,
+              totalExpectedFileSize: aggregate.totalExpectedFileSize,
+              downloadedBytes: aggregate.downloadedBytes,
+              networkSpeed: aggregate.networkSpeed,
+              timeRemaining: aggregate.timeRemaining,
               latestTaskUpdate: statusUpdate,
               message: 'Downloading segments',
             ),
           );
         },
         taskProgressCallback: (progressUpdate) {
-          final total = manifest.segments.length;
-          final progress = total > 0
-              ? (completedSegments + failedSegments) / total
-              : 0.0;
+          final segmentTaskId = progressUpdate.task.taskId;
+          final segment = segmentTelemetryByTaskId[segmentTaskId];
+          if (segment != null) {
+            segment.progress = (progressUpdate.progress.clamp(0.0, 1.0) as num)
+                .toDouble();
+            final expectedSize = progressUpdate.expectedFileSize;
+            if (expectedSize > 0) {
+              segment.expectedFileSize = expectedSize;
+            }
+            final speed = progressUpdate.networkSpeed;
+            segment.networkSpeed = speed > 0 ? speed : null;
+            segment.lastUpdated = DateTime.now();
+          }
+
+          final aggregate = _aggregateDownloadTelemetry(
+            segmentTelemetryByTaskId: segmentTelemetryByTaskId,
+            totalSegments: manifest.segments.length,
+            completedSegments: completedSegments,
+            failedSegments: failedSegments,
+          );
+
           _emitOverallUpdate(
             HlsOverallTaskUpdate(
               downloadId: downloadId,
               phase: HlsDownloadPhase.downloading,
-              totalSegments: total,
+              totalSegments: manifest.segments.length,
               completedSegments: completedSegments,
               failedSegments: failedSegments,
-              progress: progress.clamp(0.0, 1.0),
+              progress: aggregate.progress,
+              totalExpectedFileSize: aggregate.totalExpectedFileSize,
+              downloadedBytes: aggregate.downloadedBytes,
+              networkSpeed: aggregate.networkSpeed,
+              timeRemaining: aggregate.timeRemaining,
               latestTaskUpdate: progressUpdate,
               message: 'Downloading segments',
             ),
@@ -471,8 +562,12 @@ class HlsDownloader {
                         (manifest.segments.isEmpty
                             ? 0.0
                             : (completedSegments + failedSegments) /
-                                manifest.segments.length))
+                                  manifest.segments.length))
                     .clamp(0.0, 1.0),
+            totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+            downloadedBytes: lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: 'Paused',
             latestTaskUpdate: lastKnown?.latestTaskUpdate,
           ),
@@ -499,6 +594,10 @@ class HlsDownloader {
                 lastKnown?.completedSegments ?? completedSegments,
             failedSegments: lastKnown?.failedSegments ?? failedSegments,
             progress: (lastKnown?.progress ?? 0.0).clamp(0.0, 1.0),
+            totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+            downloadedBytes: lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: session.control == _SessionControl.delete
                 ? 'Deleted'
                 : 'Canceled',
@@ -512,6 +611,7 @@ class HlsDownloader {
       }
 
       if (batch.numFailed > 0) {
+        final lastKnown = _latestOverallUpdates[downloadId];
         session.phase = HlsDownloadPhase.failed;
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
@@ -521,6 +621,10 @@ class HlsDownloader {
             completedSegments: batch.numSucceeded,
             failedSegments: batch.numFailed,
             progress: 1.0,
+            totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+            downloadedBytes: lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: 'One or more segment downloads failed',
           ),
         );
@@ -547,6 +651,8 @@ class HlsDownloader {
         outputFilePath = p.join(outputRootPath, outputFileName);
         session.outputFilePath = outputFilePath;
 
+        final lastKnown = _latestOverallUpdates[downloadId];
+
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
             downloadId: downloadId,
@@ -555,6 +661,11 @@ class HlsDownloader {
             completedSegments: manifest.segments.length,
             failedSegments: 0,
             progress: 1.0,
+            totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+            downloadedBytes:
+                lastKnown?.totalExpectedFileSize ?? lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: 'Combining segments',
           ),
         );
@@ -591,6 +702,16 @@ class HlsDownloader {
           await _safeDeleteDirectory(segmentDirectoryPath);
         }
 
+        int? outputFileSize;
+        try {
+          final outputFile = File(outputFilePath);
+          if (await outputFile.exists()) {
+            outputFileSize = await outputFile.length();
+          }
+        } catch (_) {
+          // Intentionally ignored.
+        }
+
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
             downloadId: downloadId,
@@ -599,11 +720,20 @@ class HlsDownloader {
             completedSegments: manifest.segments.length,
             failedSegments: 0,
             progress: 1.0,
+            totalExpectedFileSize:
+                outputFileSize ?? lastKnown?.totalExpectedFileSize,
+            downloadedBytes:
+                outputFileSize ??
+                lastKnown?.totalExpectedFileSize ??
+                lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: 'Completed',
           ),
         );
         session.phase = HlsDownloadPhase.completed;
       } else {
+        final lastKnown = _latestOverallUpdates[downloadId];
         _emitOverallUpdate(
           HlsOverallTaskUpdate(
             downloadId: downloadId,
@@ -612,6 +742,11 @@ class HlsDownloader {
             completedSegments: manifest.segments.length,
             failedSegments: 0,
             progress: 1.0,
+            totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+            downloadedBytes:
+                lastKnown?.totalExpectedFileSize ?? lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: 'Completed',
           ),
         );
@@ -651,6 +786,10 @@ class HlsDownloader {
             completedSegments: lastKnown?.completedSegments ?? 0,
             failedSegments: lastKnown?.failedSegments ?? 0,
             progress: lastKnown?.progress ?? 0.0,
+            totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+            downloadedBytes: lastKnown?.downloadedBytes,
+            networkSpeed: null,
+            timeRemaining: null,
             message: error.message,
             latestTaskUpdate: lastKnown?.latestTaskUpdate,
           ),
@@ -684,6 +823,10 @@ class HlsDownloader {
           completedSegments: lastKnown?.completedSegments ?? 0,
           failedSegments: lastKnown?.failedSegments ?? 0,
           progress: lastKnown?.progress ?? 0.0,
+          totalExpectedFileSize: lastKnown?.totalExpectedFileSize,
+          downloadedBytes: lastKnown?.downloadedBytes,
+          networkSpeed: null,
+          timeRemaining: null,
           message: 'Unexpected failure in downloadToFile',
           latestTaskUpdate: lastKnown?.latestTaskUpdate,
         ),
@@ -774,7 +917,9 @@ class HlsDownloader {
 
       await _fileDownloader.cancelAll(group: downloadId);
 
-      final records = await _fileDownloader.database.allRecords(group: downloadId);
+      final records = await _fileDownloader.database.allRecords(
+        group: downloadId,
+      );
       if (records.isNotEmpty) {
         await _fileDownloader.cancelTasksWithIds(
           records.map((record) => record.taskId),
@@ -796,7 +941,9 @@ class HlsDownloader {
       outputCandidates.add(sessionOutput);
     }
 
-    final records = await _fileDownloader.database.allRecords(group: downloadId);
+    final records = await _fileDownloader.database.allRecords(
+      group: downloadId,
+    );
     for (final record in records) {
       if (record.task.taskId == 'hls-final-$downloadId') {
         try {
@@ -817,7 +964,9 @@ class HlsDownloader {
 
   Future<void> _safeDeleteTaskGroupArtifacts(String downloadId) async {
     final appDocDir = await getApplicationDocumentsDirectory();
-    await _safeDeleteDirectory(p.join(appDocDir.path, 'hls_segments', downloadId));
+    await _safeDeleteDirectory(
+      p.join(appDocDir.path, 'hls_segments', downloadId),
+    );
     await _deleteTaskRecordsByGroup(downloadId);
   }
 
@@ -908,6 +1057,131 @@ class HlsDownloader {
     } catch (_) {
       // Intentionally ignored.
     }
+  }
+
+  void _applySegmentStatus(_SegmentTelemetry segment, TaskStatus status) {
+    segment.lastUpdated = DateTime.now();
+    switch (status) {
+      case TaskStatus.complete:
+      case TaskStatus.failed:
+      case TaskStatus.notFound:
+        segment.progress = 1.0;
+        segment.networkSpeed = null;
+        break;
+      case TaskStatus.canceled:
+      case TaskStatus.paused:
+        segment.networkSpeed = null;
+        break;
+      case TaskStatus.running:
+      case TaskStatus.enqueued:
+      case TaskStatus.waitingToRetry:
+        break;
+    }
+  }
+
+  _AggregatedTelemetry _aggregateDownloadTelemetry({
+    required Map<String, _SegmentTelemetry> segmentTelemetryByTaskId,
+    required int totalSegments,
+    required int completedSegments,
+    required int failedSegments,
+  }) {
+    if (totalSegments <= 0) {
+      return const _AggregatedTelemetry(progress: 0.0);
+    }
+
+    final segments = segmentTelemetryByTaskId.values.toList(growable: false);
+
+    double progressUnits = 0.0;
+    for (final segment in segments) {
+      progressUnits += (segment.progress.clamp(0.0, 1.0) as num).toDouble();
+    }
+
+    final completedUnitsFloor = (completedSegments + failedSegments).toDouble();
+    if (progressUnits < completedUnitsFloor) {
+      progressUnits = completedUnitsFloor;
+    }
+
+    final progress = (progressUnits / totalSegments).clamp(0.0, 1.0);
+
+    final knownSizeSegments = segments
+        .where((s) => (s.expectedFileSize ?? 0) > 0)
+        .toList();
+    final knownSizeCount = knownSizeSegments.length;
+    final knownTotalBytes = knownSizeSegments.fold<double>(
+      0.0,
+      (sum, segment) => sum + segment.expectedFileSize!.toDouble(),
+    );
+
+    final averageSegmentSize = knownSizeCount > 0
+        ? knownTotalBytes / knownSizeCount
+        : null;
+
+    int? estimatedTotalBytes;
+    if (knownSizeCount == totalSegments) {
+      estimatedTotalBytes = knownTotalBytes.round();
+    } else if (averageSegmentSize != null) {
+      estimatedTotalBytes =
+          (knownTotalBytes +
+                  (totalSegments - knownSizeCount) * averageSegmentSize)
+              .round();
+    }
+
+    double downloadedBytesEstimate = 0.0;
+    for (final segment in segments) {
+      final segmentProgress = (segment.progress.clamp(0.0, 1.0) as num)
+          .toDouble();
+      final expectedSize = segment.expectedFileSize;
+      if (expectedSize != null && expectedSize > 0) {
+        downloadedBytesEstimate += expectedSize * segmentProgress;
+      } else if (averageSegmentSize != null) {
+        downloadedBytesEstimate += averageSegmentSize * segmentProgress;
+      }
+    }
+
+    int? downloadedBytes;
+    if (estimatedTotalBytes != null) {
+      final clampedDownloaded = downloadedBytesEstimate.clamp(
+        0.0,
+        estimatedTotalBytes.toDouble(),
+      );
+      downloadedBytes = clampedDownloaded.round();
+    }
+
+    final now = DateTime.now();
+    double totalNetworkSpeed = 0.0;
+    bool hasNetworkSpeed = false;
+    for (final segment in segments) {
+      final speed = segment.networkSpeed;
+      final isFresh =
+          now.difference(segment.lastUpdated).inMilliseconds <= 2500;
+      if (speed != null && speed > 0 && segment.progress < 1.0 && isFresh) {
+        totalNetworkSpeed += speed;
+        hasNetworkSpeed = true;
+      }
+    }
+
+    final networkSpeed = hasNetworkSpeed ? totalNetworkSpeed : null;
+
+    Duration? timeRemaining;
+    if (estimatedTotalBytes != null &&
+        downloadedBytes != null &&
+        networkSpeed != null &&
+        networkSpeed > 0) {
+      final remainingBytes = (estimatedTotalBytes - downloadedBytes).clamp(
+        0,
+        estimatedTotalBytes,
+      );
+      final seconds = (remainingBytes / networkSpeed).ceil();
+      timeRemaining = Duration(seconds: seconds < 0 ? 0 : seconds);
+    }
+
+    return _AggregatedTelemetry(
+      progress: (progress as num).toDouble(),
+      totalExpectedFileSize: estimatedTotalBytes,
+      downloadedBytes: downloadedBytes,
+      networkSpeed: networkSpeed,
+      timeRemaining: timeRemaining,
+    );
   }
 
   void _log({
