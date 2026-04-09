@@ -1,46 +1,25 @@
 # background_downloader_hls
 
-`background_downloader_hls` is a Flutter package for downloading HLS playlists
-(`.m3u8`) and combining segments into a single file.
-
-It is built on top of
-[`background_downloader`](https://pub.dev/packages/background_downloader),
-with additional HLS-specific features:
-
-- input validation with typed exceptions
-- master playlist variant selection
-- fallback parsing for irregular playlists
-- optional AES-128 segment decryption (when keys are available)
-- cross-platform path handling
-- minimal, callback-based logging (no noisy `print` logs)
+A Flutter package to download HLS playlists (`.m3u8`) and combine their segments into a single file. Built efficiently on top of [`background_downloader`](https://pub.dev/packages/background_downloader).
 
 ## Features
-
-- Download media playlists directly, or resolve master playlists automatically.
-- Choose variant strategy:
-	- highest bandwidth
-	- lowest bandwidth
-	- first variant
-- Combine downloaded segments in deterministic order.
-- Optional cleanup of temporary segment files.
-- Typed options/result objects for production integrations.
+* **Smart Playlists:** Auto-resolves master playlists (choose highest, lowest, or first variant bandwidth).
+* **Secure & Resilient:** Supports AES-128 decryption, fallback parsing, and strict input validation.
+* **Tidy:** Deterministic segment combining with automatic temp-file cleanup.
+* **Quiet:** Callback-based logging—zero noisy `print` statements.
 
 ## Installation
 
-Add dependency:
+Add it to your `pubspec.yaml`:
 
 ```yaml
 dependencies:
-	background_downloader_hls: ^0.1.0
-```
-
-Then run:
-
-```bash
-flutter pub get
+  background_downloader_hls: ^0.1.0
 ```
 
 ## Quick Start
+
+The recommended approach for all new integrations is `downloadToFile`:
 
 ```dart
 import 'package:background_downloader_hls/background_downloader_hls.dart';
@@ -48,90 +27,45 @@ import 'package:background_downloader_hls/background_downloader_hls.dart';
 final downloader = HlsDownloader();
 
 final result = await downloader.downloadToFile(
-	'https://example.com/playlist.m3u8',
-	'my_video',
-	options: const HlsDownloadOptions(
-		variantSelection: HlsVariantSelection.highestBandwidth,
-		outputFileExtension: 'mp4',
-	),
+  '[https://example.com/playlist.m3u8](https://example.com/playlist.m3u8)',
+  'my_video',
+  options: const HlsDownloadOptions(
+    variantSelection: HlsVariantSelection.highestBandwidth,
+    outputFileExtension: 'mp4',
+  ),
 );
 
 if (result.isSuccess) {
-	// result.outputFilePath -> combined file path
+  // Access your combined file here
+  print('Saved to: ${result.outputFilePath}');
 }
 ```
+*(Note: A legacy `download()` method remains available for backwards compatibility).*
 
 ## Logging
 
-Logging is callback-based and off by default unless you provide a callback.
+Logging is completely off by default. To capture logs, pass a callback when initializing the downloader:
 
 ```dart
 final downloader = HlsDownloader(
-	logCallback: (level, message, error, stackTrace) {
-		// Send to your logger/monitoring system.
-	},
-);
-
-await downloader.downloadToFile(
-	'https://example.com/playlist.m3u8',
-	'video',
-	options: const HlsDownloadOptions(logLevel: HlsLogLevel.info),
+  logCallback: (level, message, error, stackTrace) {
+    // Pipe to your own logger or monitoring system
+  },
 );
 ```
 
-## API Overview
+## Error Handling
 
-### `downloadToFile`
+Failures are predictable. The package throws an `HlsDownloadException` for expected errors, returning specific codes so you can handle them gracefully:
 
-```dart
-Future<HlsDownloadResult> downloadToFile(
-	String manifestUrl,
-	String fileName, {
-	HlsDownloadOptions options = const HlsDownloadOptions(),
-})
-```
+* `invalid_url` / `invalid_file_name` / `invalid_options`
+* `playlist_parse_failed` / `empty_playlist`
+* `segment_download_failed` / `segment_missing`
+* `encryption_key_fetch_failed`
+* `combine_failed` / `unexpected`
 
-### `download` (legacy compatibility)
+## Notes & Limitations
 
-```dart
-Future<bool> download(
-	String streamLink,
-	String fileName, {
-	int retryAttempts = 3,
-	int parallelBatches = 5,
-	Map<String, String> customHeaders = const {},
-	String? subsUrl,
-})
-```
-
-`downloadToFile` is recommended for new integrations.
-
-## Validation and Errors
-
-The package throws `HlsDownloadException` for expected failures.
-
-Common codes:
-
-- `invalid_url`
-- `invalid_file_name`
-- `invalid_options`
-- `playlist_parse_failed`
-- `empty_playlist`
-- `segment_download_failed`
-- `segment_missing`
-- `encryption_key_fetch_failed`
-- `combine_failed`
-- `unexpected`
-
-## Platform Notes
-
-- Works with Flutter platforms supported by `background_downloader`.
-- Uses platform-safe path handling (no hardcoded separators).
-- Temporary segments are stored under app documents by default.
-
-## Limitations
-
-- Some HLS streams require advanced DRM or server-side authorization workflows
-	that are outside the scope of this package.
-- Segment combine is byte-append based. For strict remux/transcode workflows,
-	post-process with a media toolchain like FFmpeg.
+* **Path Handling:** Uses platform-safe paths. Temporary segments are stored in the app documents directory by default.
+* **Simple Merging:** Segment combining is byte-append based. If you need strict remuxing or transcoding, post-process the combined file with a toolchain like FFmpeg.
+* **DRM:** Advanced DRM or complex server-side authorization workflows are outside the scope of this package.
