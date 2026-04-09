@@ -1,6 +1,6 @@
 name: background_downloader_hls
 description: "A Flutter package to download and combine HLS (.m3u8) as an extension to background_downloader."
-version: 0.1.0
+version: 0.2.0
 homepage: https://github.com/abhishek-m-raj/background_downloader_hls
 repository: https://github.com/abhishek-m-raj/background_downloader_hls.git
 topics:
